@@ -1,5 +1,13 @@
 # 常见问题与排查
 
+## 快捷 Skill 没有出现在选择菜单
+
+1.1.0 之前的安装只注册 MCP 工具，没有安装 Skill。更新项目后运行 configure.cmd，重启 Claude Code 和 Codex。Claude 输入 `/to-codex`；Codex 搜索 `to-claude`、`claude-sessions`，CLI/IDE 也可通过 `/skills` 或 `$` 选择。
+
+运行 doctor.cmd --json，查看 skills.installed / skills.valid 和文件路径；自定义用户目录时确认路径一致。文件完整性检查不能证明当前宿主已经重新加载；也应检查宿主是否将同名 Skill 禁用。
+
+Skill 文件被本地修改后，安装、测试或卸载会提示冲突。先备份你的改动并与项目模板比较，决定保留的版本，再重新配置；程序不会覆盖用户自定义内容。
+
 ## 安装后 AI 看不到工具
 
 先运行 `doctor.cmd --json`，确认依赖可用，再运行 `test.cmd --json`。两个 MCP 都显示 connected 后，重新启动终端 Claude Code 和 Codex 桌面端。当前已经运行的宿主进程不一定会自动读取新注册。

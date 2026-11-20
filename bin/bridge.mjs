@@ -6,6 +6,7 @@ import { defaultPaths, findDependencies, sourceRoot } from "../src/runtime.mjs";
 import { install, uninstall } from "../src/lifecycle.mjs";
 import { smoke } from "../src/smoke.mjs";
 import { liveTest } from "../src/live-check.mjs";
+import { inspectSkills } from "../src/skills.mjs";
 
 const definitions = new Map([
   ["--state-dir", "stateDir"], ["--codex-home", "codexHome"], ["--claude-home", "claudeHome"],
@@ -48,20 +49,22 @@ async function main() {
   runtime.sessionsRoot = path.join(runtime.codexHome, "sessions");
   runtime.dependencyOverrides = dependencyOverrides;
   runtime.claudeConfigDirOverride = !!flags.claudeHome || !!process.env.CLAUDE_CONFIG_DIR || !!previous.claudeConfigDirOverride;
-  Object.assign(options, { claudeHome: runtime.claudeHome, claudeConfigDirOverride: runtime.claudeConfigDirOverride, codexConfig: runtime.codexConfig, claudeConfig: runtime.claudeConfig });
+  Object.assign(options, { codexHome: runtime.codexHome, claudeHome: runtime.claudeHome, claudeConfigDirOverride: runtime.claudeConfigDirOverride, codexConfig: runtime.codexConfig, claudeConfig: runtime.claudeConfig });
   if (command === "doctor") {
     const pathsExist = {};
     for (const [key, file] of [["codexSessions", runtime.sessionsRoot], ["claudeSessions", path.join(runtime.claudeHome, "sessions")], ["claudeConfig", runtime.claudeConfig], ["codexConfig", runtime.codexConfig]]) pathsExist[key] = await fs.access(file).then(() => true, () => false);
-    console.log(JSON.stringify({ ...dependencies, stateDir: options.stateDir, configFiles: { claude: runtime.claudeConfig, codex: runtime.codexConfig }, pathsExist, loginVerified: false, desktopRunningVerified: false, modelExecutionVerified: false }, null, 2));
+    console.log(JSON.stringify({ ...dependencies, stateDir: options.stateDir, configFiles: { claude: runtime.claudeConfig, codex: runtime.codexConfig }, pathsExist, skills: await inspectSkills(options.stateDir), loginVerified: false, desktopRunningVerified: false, modelExecutionVerified: false }, null, 2));
     if (!dependencies.ready) process.exitCode = 1;
     return;
   }
   if (!dependencies.ready) throw new Error(`${dependencies.diagnostics.join("\n")}\nInstall Node.js >=22, Codex Desktop (with queue support), Claude Code CLI and Python 3. See README.md for official download links.`);
   if (command === "test") {
+    const skills = await inspectSkills(options.stateDir);
+    if (!skills.valid) throw new Error("Shortcut skills are missing or changed. Run configure.cmd or resolve the skill conflict before testing.");
     const result = flags.live
       ? await liveTest({ sourceRoot, configFile, claudeSession: flags.claudeSession, codexThread: flags.codexThread })
       : await smoke({ sourceRoot, configFile });
-    console.log(JSON.stringify(result, null, 2));
+    console.log(JSON.stringify({ ...result, skills }, null, 2));
     if (flags.live && Object.values(result).some(value => typeof value === "object" && !value.passed)) process.exitCode = 1;
     return;
   }

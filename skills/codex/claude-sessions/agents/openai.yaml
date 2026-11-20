@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude 会话 · claude-sessions"
+  short_description: "列出本机在线 Claude 终端的完整会话 ID、名称、项目目录和进程号"
+  default_prompt: "使用 $claude-sessions 列出在线 Claude 会话，显示完整 ID、名称和项目。"

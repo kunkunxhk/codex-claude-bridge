@@ -20,6 +20,8 @@ test("CLI installation, repeat configuration, test and uninstall work outside th
   await run("configure");
   const check = await run("test");
   assert.equal(JSON.parse(check.stdout).modelTaskSent, false);
+  assert.equal(JSON.parse(check.stdout).skills.valid, true);
+  assert.equal(JSON.parse(check.stdout).skills.shortcuts.length, 3);
   const manifest = JSON.parse(await fs.readFile(path.join(state, "manifest.json")));
   assert.equal(manifest.installed.codex.env.CLAUDE_CONFIG_DIR, claude);
   await run("uninstall");

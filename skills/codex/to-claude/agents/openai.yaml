@@ -1,0 +1,4 @@
+interface:
+  display_name: "交给 Claude · to-claude"
+  short_description: "把任务发送到指定 Claude 终端，或在当前项目打开新终端并读取回复"
+  default_prompt: "使用 $to-claude 将下面的任务交给 Claude Code 并读取回复。"

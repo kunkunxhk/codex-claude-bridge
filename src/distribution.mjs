@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const rootFiles = new Set(["README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "package.json", "package-lock.json", ".gitignore", "run.cmd", "install.cmd", "configure.cmd", "doctor.cmd", "test.cmd", "uninstall.cmd"]);
-const directories = new Set(["src", "bin", "test", "docs", "vendor"]);
+const directories = new Set(["src", "bin", "test", "docs", "vendor", "skills"]);
 export async function distributionFiles(root) {
   const files = [];
   async function walk(relative) {

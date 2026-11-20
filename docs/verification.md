@@ -1,4 +1,16 @@
-# Windows 1.0.0 验证记录
+# Windows 验证记录
+
+## 1.1.0：快捷 Skill
+
+- `npm test`：41 项全部通过，包含快捷 Skill 安装/重装/卸载、旧 manifest 升级、用户同名/改动冲突、事务回滚以及 Windows 路径大小写回归。
+- skill-creator 的验证器校验两个 Codex SKILL.md 通过；Claude 扩展 frontmatter 与 Codex openai.yaml 也已解析校验。
+- 本机已安装 Claude 的 to-codex，以及 Codex 的 to-claude、claude-sessions。doctor/test 报告 skills.installed=true、skills.valid=true，两个 stdio MCP 正常连接。
+- 真实 Claude CLI 输入 `/to-codex`，正确加载入口并询问缺失的任务，没有发送空任务。
+- Codex 原生 app-server 的 skills/list 实测发现两个 Skill，均 enabled=true，并正确返回中文界面名称；不需要模型调用即可验证本地技能发现。
+- 额外尝试了 Codex CLI 用模型执行 claude-sessions，试跑因超时未完成，不据此宣称完整模型驱动流程成功。MCP 只读列表调用及原生 Skill 发现分别已独立验证。
+- 现有正在运行的宿主可能缓存 Skill 菜单，安装/更新后仍需重启或按宿主支持的方式刷新。
+
+以下保留 1.0.0 的初始验证记录。
 
 ## 环境
 

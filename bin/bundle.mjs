@@ -11,7 +11,11 @@ const execute = promisify(execFile);
 const dependencies = await findDependencies();
 if (!dependencies.pythonBin) throw new Error("Python 3 is required to build the ZIP");
 const files = await distributionFiles(sourceRoot);
-const required = ["README.md", "LICENSE", "package-lock.json", "install.cmd", "src/server.mjs", "src/claude-server.mjs", "vendor/codex-mcp-bridge/LICENSE"];
+const required = [
+  "README.md", "LICENSE", "package-lock.json", "install.cmd", "src/server.mjs", "src/claude-server.mjs", "vendor/codex-mcp-bridge/LICENSE",
+  "skills/claude/to-codex/SKILL.md", "skills/codex/to-claude/SKILL.md", "skills/codex/to-claude/agents/openai.yaml",
+  "skills/codex/claude-sessions/SKILL.md", "skills/codex/claude-sessions/agents/openai.yaml",
+];
 for (const file of required) if (!files.includes(file)) throw new Error(`Missing distribution file: ${file}`);
 const home = os.homedir(), sensitiveStrings = [home, home.replaceAll("\\", "/"), home.replaceAll("\\", "\\\\")].filter(value => value.length > 5);
 for (const file of files) {

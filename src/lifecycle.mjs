@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import TOML from "@iarna/toml";
+import { prepareSkills, restoreSkills } from "./skills.mjs";
 
 const own = (value, key) => Object.hasOwn(value || {}, key);
 const parseJson = text => text.trim() ? JSON.parse(text) : {};
@@ -49,7 +50,9 @@ async function atomic(file, text) {
 }
 async function replaceIfUnchanged(file, before, after) {
   if (await read(file) !== before) throw new Error(`Configuration changed during operation: ${file}`);
-  await atomic(file, after);
+  if (before === after) return;
+  if (after === null) await fs.rm(file, { force: true });
+  else await atomic(file, after);
 }
 
 async function locked(options, run) {
@@ -80,10 +83,16 @@ async function transaction(options, before, after, manifest) {
     before.settings = own(options, "expectedSettingsText") ? options.expectedSettingsText : await read(files.settings);
     after.settings = options.settingsText;
   }
+  for (const [index, change] of (options.fileChanges || []).entries()) {
+    const key = `skill${index}`;
+    files[key] = change.file;
+    before[key] = change.before;
+    after[key] = change.after;
+  }
   const keys = Object.keys(files);
   const backupDir = path.join(options.stateDir, "backups", `${Date.now()}-${randomUUID()}`);
   await fs.mkdir(backupDir, { recursive: true });
-  for (const key of keys) if (before[key] !== null) await fs.writeFile(path.join(backupDir, key === "codex" ? "codex.toml" : `${key}.json`), before[key], { mode: 0o600 });
+  for (const key of keys) if (before[key] !== null) await fs.writeFile(path.join(backupDir, key === "codex" ? "codex.toml" : `${key}.${key.startsWith("skill") ? "txt" : "json"}`), before[key], { mode: 0o600 });
   const journal = { files, before, after };
   const journalFile = path.join(options.stateDir, "pending-transaction.json");
   if (await read(journalFile) !== null) throw new Error(`Unfinished transaction: inspect ${journalFile} and backups before retrying`);
@@ -122,10 +131,12 @@ export async function install(options) {
     const current = { claude: entry(parseJson(before.claude || ""), "mcpServers", "codex-queue"), codex: entry(parseToml(before.codex || ""), "mcp_servers", "claude-terminal") };
     if (previous?.active && (!isDeepStrictEqual(current.claude, previous.installed.claude) || !isDeepStrictEqual(current.codex, previous.installed.codex))) throw new Error("Managed configuration changed since installation; conflict, refusing to overwrite");
     const installed = registration(options);
+    const skills = await prepareSkills(options, previous?.active ? previous.skills : []);
     const after = { claude: patchClaude(before.claude || "", installed.claude), codex: patchCodex(before.codex || "", installed.codex) };
-    const manifest = { version: 1, active: true, sourceRoot: options.sourceRoot, claudeConfig: options.claudeConfig, codexConfig: options.codexConfig, previous: previous?.active ? previous.previous : current, installed };
-    if (options.dryRun) return { dryRun: true, files: [options.claudeConfig, options.codexConfig], installed };
-    return { active: true, ...await transaction(options, before, after, manifest) };
+    const manifest = { version: 1, active: true, sourceRoot: options.sourceRoot, claudeConfig: options.claudeConfig, codexConfig: options.codexConfig, previous: previous?.active ? previous.previous : current, installed, skills: skills.records };
+    const shortcuts = [...new Set(skills.records.map(item => `${item.host}:${item.name}`))];
+    if (options.dryRun) return { dryRun: true, files: [options.claudeConfig, options.codexConfig, ...skills.changes.map(item => item.file)], installed, shortcuts };
+    return { active: true, shortcuts, ...await transaction({ ...options, fileChanges: skills.changes }, before, after, manifest) };
   });
 }
 
@@ -138,8 +149,9 @@ export async function uninstall(options) {
     const before = { claude: await read(targets.claudeConfig), codex: await read(targets.codexConfig) };
     const current = { claude: entry(parseJson(before.claude || ""), "mcpServers", "codex-queue"), codex: entry(parseToml(before.codex || ""), "mcp_servers", "claude-terminal") };
     if (!isDeepStrictEqual(current, manifest.installed)) throw new Error("Managed configuration changed: uninstall conflict; user edits preserved");
+    const skillChanges = await restoreSkills(manifest.skills);
     const after = { claude: patchClaude(before.claude || "", manifest.previous.claude), codex: patchCodex(before.codex || "", manifest.previous.codex) };
-    if (options.dryRun) return { dryRun: true, files: [targets.claudeConfig, targets.codexConfig] };
-    return { active: false, ...await transaction(targets, before, after, { ...manifest, active: false }) };
+    if (options.dryRun) return { dryRun: true, files: [targets.claudeConfig, targets.codexConfig, ...skillChanges.map(item => item.file)] };
+    return { active: false, ...await transaction({ ...targets, fileChanges: skillChanges }, before, after, { ...manifest, active: false }) };
   });
 }

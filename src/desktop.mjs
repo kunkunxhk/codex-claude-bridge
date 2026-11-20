@@ -45,7 +45,7 @@ export async function createDesktopThread(config, cwd, onCreated = async () => {
   child.stdin.on("error", fail);
   let threadId;
   try {
-    await call("initialize", { clientInfo: { name: "codex-claude-bridge", version: "1.0.0" } });
+    await call("initialize", { clientInfo: { name: "codex-claude-bridge", version: "1.1.0" } });
     child.stdin.write(JSON.stringify({ method: "initialized", params: {} }) + "\n");
     const response = await call("thread/start", { cwd, ephemeral: false, approvalPolicy: "on-request", sandbox: "workspace-write" });
     threadId = response.thread?.id;

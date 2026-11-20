@@ -1,10 +1,21 @@
 {
   "name": "codex-claude-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Windows stdio MCP bridge between Codex Desktop chats and Claude Code terminals",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
-  "scripts": { "test": "node --test", "doctor": "node bin/bridge.mjs doctor", "smoke": "node bin/bridge.mjs test", "bundle": "node bin/bundle.mjs" },
-  "dependencies": { "@modelcontextprotocol/sdk": "1.32.1", "@iarna/toml": "2.2.5", "zod": "4.6.7" }
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "doctor": "node bin/bridge.mjs doctor",
+    "smoke": "node bin/bridge.mjs test",
+    "bundle": "node bin/bundle.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@iarna/toml": "2.2.5",
+    "zod": "4.6.7"
+  }
 }

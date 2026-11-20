@@ -2,6 +2,14 @@
 
 本文解释这座桥能做什么，以及会话、任务和回复之间的关系。安装步骤见 [README](../README.md)，参数见 [工具参考](reference.md)。
 
+## 快捷 Skill 与 MCP 的关系
+
+1.1.0 起安装脚本会同时安装三个快捷 Skill。MCP 提供发送/读取的工具接口，Skill 将“选目标、发送一次、保留 requestId、等待并汇报”的步骤写成可重复调用的入口。
+
+Claude 中使用 `/to-codex 任务内容` 或 `/to-codex --thread UUID 任务内容`。Codex 中使用 `$to-claude 任务内容`、`$to-claude --session UUID 任务内容`，或者 `$claude-sessions` 查询在线 ID。Codex 桌面可在技能选择器中按名称搜索。
+
+这些 Skill 不启动其他委托包装器，也不替换目标会话的权限。省略目标 ID 仍表示新建，指定 ID 才续接。旧版用户运行 configure.cmd 后重启宿主即可获得入口。
+
 ## 1. 它连接的是正在使用的 AI 会话
 
 你在 Claude Code 中提出任务，Claude 可以通过 MCP 把任务交给 Codex 桌面聊天；你在 Codex 中提出任务，也可以交给终端 Claude Code。接收端执行任务，调用方再读取结果。

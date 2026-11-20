@@ -4,7 +4,7 @@
 
 例如：让 Claude 把代码审查交给某个 Codex 桌面聊天；也可以让 Codex 打开可见的 Claude 终端处理任务。你能在接收端继续查看和参与对话。
 
-**当前版本：1.0.0 · Windows · MIT**
+**当前版本：1.1.0 · Windows · MIT**
 
 [功能与原理讲解](docs/guide.md) · [工具与参数参考](docs/reference.md) · [常见问题](docs/troubleshooting.md) · [验证记录](docs/verification.md) · [第三方来源](THIRD_PARTY_NOTICES.md)
 
@@ -23,7 +23,8 @@ flowchart LR
 - **省略 ID 新建**：创建 Codex 桌面聊天，或打开可见的 Claude 原生终端。
 - **跨本地项目**：不用为每个项目、会话 ID 手改配置。
 - **发送后查询**：通过 requestId 等待和读取结果，超时后继续查询。
-- **独立安装维护**：检测依赖、备份配置、一键安装、测试和卸载。
+- **快捷 Skill**：Claude 中用 `/to-codex`，Codex 中选择 `to-claude` 或 `claude-sessions`，不用记完整 MCP 名称。
+- **独立安装维护**：检测依赖、备份配置、一键安装、测试和卸载，同时管理配套 Skill。
 
 当前范围是同一 Windows 用户的本地会话。它不提供其他 AI 执行器、远程机器调度或自动循环对话，也不替代接收端的权限审批。
 
@@ -39,7 +40,7 @@ cd codex-claude-bridge
 1. 将下载的 ZIP 解压到一个长期保留的目录，或进入克隆目录。路径可以含中文和空格。不要在 ZIP 内直接运行。
 2. 确保已安装并登录 Codex 桌面端和终端 Claude Code，且能分别正常回答问题。
 3. 安装 Node.js 22+（包含 npm）和 Python 3，将 Node 加入 PATH。
-4. 双击 **install.cmd**，安装锁定的 npm 依赖，自动检测原生执行文件，先做 MCP 连接测试，再备份并写入两端配置。
+4. 双击 **install.cmd**，安装锁定的 npm 依赖，自动检测原生执行文件，先做 MCP 连接测试，再备份并写入两端配置和快捷 Skill。
 5. 重新启动 Claude Code 和 Codex 桌面端，双击 **test.cmd** 检查连接。
 
 安装本项目不需要管理员权限。安装 npm 依赖需要网络。不会自动安装、登录或更改第三方 CLI 的模型、权限、账号和额度。
@@ -50,11 +51,11 @@ cd codex-claude-bridge
 
 | 文件 | 行为 |
 | --- | --- |
-| install.cmd | npm ci、检测依赖、测试入口、备份并注册双向 MCP |
-| configure.cmd | 重新检测、配置；也用于移动目录或 CLI 更新后刷新 |
-| doctor.cmd | 检查可执行文件、版本和 queue 能力；报告配置/历史目录是否存在 |
-| test.cmd | 启动两端 stdio MCP，发现工具，调用只读状态/在线会话列表 |
-| uninstall.cmd | 恢复安装前的两个 MCP 项，保留其他设置和所有聊天记录 |
+| install.cmd | npm ci、检测依赖、测试入口、备份并注册双向 MCP 及三个快捷 Skill |
+| configure.cmd | 重新检测、配置、更新 Skill；旧版升级到 1.1.0 时也使用此入口 |
+| doctor.cmd | 检查可执行文件、版本和 queue 能力；显示 Skill 安装路径与完整性 |
+| test.cmd | 检查 Skill 文件，再启动两端 stdio MCP 并调用只读状态/在线会话列表 |
+| uninstall.cmd | 恢复安装前的两个 MCP 项和受管理的 Skill 文件，保留其他设置和聊天记录 |
 
 双击执行结束会暂停，便于阅读错误。脚本化执行可使用 `node bin/bridge.mjs <命令> --json`。`test.cmd --json` 同样不会暂停。
 
@@ -67,6 +68,22 @@ test.cmd --live --claude-session "替换为在线Claude会话UUID" --codex-threa
 可只填其中一个。它会向指定会话发送固定的“只回复测试标识、不调用工具”的消息，等待并核对回复，消耗接收方正常额度。不会自动创建新窗口/聊天，超时也不重发。输出 `requestId` 可供后续 read/wait。
 
 ## 在 AI 里使用
+
+安装后可直接使用以下快捷入口：
+
+| 宿主 | 快捷入口 | 作用 |
+| --- | --- | --- |
+| Claude Code | `/to-codex 任务内容` | 在当前项目新建 Codex 桌面聊天，投递并等待回复 |
+| Claude Code | `/to-codex --thread UUID 任务内容` | 交给指定 Codex 聊天 |
+| Codex | `$to-claude 任务内容` | 在当前项目打开新 Claude 终端，投递并等待回复 |
+| Codex | `$to-claude --session UUID 任务内容` | 交给指定在线 Claude 会话 |
+| Codex | `$claude-sessions` | 仅列出在线 Claude 会话及完整 ID |
+
+在 Codex 桌面端也可以从技能选择器中搜索 `to-claude` 或 `claude-sessions`；CLI/IDE 可用 `/skills` 或 `$` 选择。不同客户端的菜单入口可能不同，Skill 名称相同。Skill 负责组装调用流程，执行仍由 MCP 和接收端完成。
+
+Claude Skill 安装到 Claude 用户目录的 `skills/to-codex`；Codex Skill 安装到 Codex 用户目录的 `skills/to-claude` 和 `skills/claude-sessions`。遵循自定义 --claude-home / --codex-home。安装后未出现时重启宿主，检查 doctor 的 skills 部分。
+
+也可以用自然语言调用：
 
 对 Claude 说：
 
@@ -115,8 +132,8 @@ configure.cmd --codex-bin "X:\apps\codex.exe" --claude-bin "X:\apps\claude.exe" 
 
 ## 卸载、升级和恢复
 
-- 卸载只恢复这次安装前的两个 MCP 项；如果它们原来不存在就删除对应项。若安装前存在旧桥接，卸载会恢复旧注册。
-- 重复安装保留最初的恢复记录。若用户手动改过被管理的 MCP 项，安装/卸载会拒绝覆盖，提示冲突。其他配置仍可自由修改。
+- 卸载恢复这次安装前的两个 MCP 项和受管理的 Skill 文件；原来不存在的文件会删除，Skill 目录中的其他用户文件会保留。若安装前存在旧桥接，卸载会恢复旧注册。
+- 重复安装保留最初的恢复记录。若用户手动改过被管理的 MCP 项或 Skill 文件，安装/卸载会拒绝覆盖，提示冲突。遇到不属于本项目的同名 Skill 也会停止，保留原文件。其他配置仍可自由修改。
 - 不删除聊天、登录状态、业务文件、CLI、源码、node_modules、回执和备份。卸载后可手动删除源码目录；如有恢复旧桥接，先确认它仍可运行。
 - 升级：解压新版到稳定位置，运行 configure.cmd（缺 npm 依赖时会先安装），然后重启两端。不要直接删掉仍被配置引用的旧目录。
 - 如果进程被强行终止导致 `install.lock` 或 `pending-transaction.json` 残留，先确认没有安装进程，查看日志中的 files/before/after 与 backups，恢复所需配置，再移除残留文件；程序不会猜测并覆盖可能的新改动。事务日志和备份可能含原有配置的敏感信息，不要分享。

@@ -2,6 +2,14 @@
 
 以下 JSON 是 MCP 工具的参数示例，由宿主调用，不是直接粘贴到 CMD 执行的命令。示例 UUID 仅为格式占位，运行前必须替换为本机真实目标/请求 ID。
 
+## 快捷入口（1.1.0）
+
+Claude Code：`/to-codex [--thread UUID] 任务内容`。
+
+Codex：`$to-claude [--session UUID] 任务内容`、`$claude-sessions`。桌面端也可从技能选择器按名称选择；CLI/IDE 支持 `/skills`。这些入口调用下方现有 MCP 工具，不新增工具或权限。
+
+doctor 输出 skills.installed、skills.valid 和各 Skill 的安装路径。test 会校验文件仍与本次安装记录一致，但不代表当前已经运行的宿主刷新了 Skill 列表。
+
 ## Claude 中的 codex-queue
 
 | 工具 | 参数 | 作用 |
