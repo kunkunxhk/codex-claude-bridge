@@ -1,0 +1,28 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { sourceRoot } from "../src/runtime.mjs";
+
+const execute = promisify(execFile);
+test("CLI installation, repeat configuration, test and uninstall work outside the user's profiles", { skip: process.platform !== "win32", timeout: 60000 }, async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "bridge 中文 space-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const state = path.join(root, "state"), codex = path.join(root, "codex"), claude = path.join(root, "claude");
+  const common = ["--state-dir", state, "--codex-home", codex, "--claude-home", claude, "--json"];
+  const run = command => execute(process.execPath, [path.join(sourceRoot, "bin", "bridge.mjs"), command, ...common], { timeout: 20000, windowsHide: true });
+  await run("install");
+  const settings = JSON.parse(await fs.readFile(path.join(state, "settings.json")));
+  assert.equal(settings.claudeHome, claude);
+  await run("configure");
+  const check = await run("test");
+  assert.equal(JSON.parse(check.stdout).modelTaskSent, false);
+  const manifest = JSON.parse(await fs.readFile(path.join(state, "manifest.json")));
+  assert.equal(manifest.installed.codex.env.CLAUDE_CONFIG_DIR, claude);
+  await run("uninstall");
+  assert.equal(JSON.parse(await fs.readFile(path.join(claude, ".claude.json"))).mcpServers["codex-queue"], undefined);
+  assert.doesNotMatch(await fs.readFile(path.join(codex, "config.toml"), "utf8"), /claude-terminal/);
+});

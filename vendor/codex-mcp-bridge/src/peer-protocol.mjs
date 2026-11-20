@@ -1,0 +1,1392 @@
+import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+
+import { homeDir, IS_WINDOWS } from "./platform.mjs";
+import { cloneReloadState, drainPendingAccepts } from "./reload-control.mjs";
+import { hardenedBridgeEnabled } from "./hardened-root-policy.mjs";
+import { protectCurrentUserPipe } from "./windows-pipe-acl.mjs";
+
+const SOCKET_DIR = "/tmp/cc-socks";
+
+/**
+ * Windows has no /tmp, and path.join rewrites the unix default to "\tmp\cc-socks"
+ * on the system drive, where listen() fails with EACCES. The endpoint then never
+ * comes up, so Claude has no address to answer on and the bridge is silently
+ * one-way: messages reach Claude, replies never come back.
+ *
+ * Claude Code advertises a named pipe on Windows for exactly this reason, so the
+ * peer uses the same transport there. net.connect({ path }) and server.listen()
+ * accept a pipe name unchanged, so only creation differs - a pipe has no
+ * directory to create, no mode to chmod and no file to unlink beforehand.
+ */
+function peerSocketPath(pid) {
+  return IS_WINDOWS ? `\\\\.\\pipe\\LOCAL\\cc-msg-${crypto.randomBytes(16).toString("hex")}` : path.join(SOCKET_DIR, `${pid}.sock`);
+}
+const PEER_PROTOCOL_VERSION = 1;
+const CLAUDE_VERSION_HINT = "2.1.229";
+const PS_BIN = "/bin/ps";
+
+const claudeHome = () => process.env.CODEX_BRIDGE_CLAUDE_HOME || process.env.CLAUDE_CONFIG_DIR || path.join(homeDir(), ".claude");
+const sessionsDir = () => path.join(claudeHome(), "sessions");
+const projectsDir = () => path.join(claudeHome(), "projects");
+
+/**
+ * A Claude Code session advertises itself in ~/.claude/sessions/<pid>.json and
+ * listens for peer messages on a local socket or Windows named pipe. Messages are newline-delimited
+ * JSON; the wrapper element is what Claude renders in its chat surface.
+ */
+export function buildFrame({ text, fromSocket, fromName, priority = "next", permissionMode }) {
+  const msgId = crypto.randomUUID();
+  const from = `uds:${fromSocket.replace(/[^A-Za-z0-9:_/.\-]/gu, (character) => Array.from(Buffer.from(character), (byte) => `%${byte.toString(16).toUpperCase().padStart(2, "0")}`).join(""))}`;
+  const displayName = typeof fromName === "string" ? fromName.replace(/["<>\p{Cf}\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/gu, "").trim() : "";
+  const name = displayName ? ` from-name="${displayName}"` : "";
+  const mode = ["bypass", "prompting"].includes(permissionMode) ? ` from-mode="${permissionMode}"` : "";
+  return {
+    msgV: PEER_PROTOCOL_VERSION,
+    msg_id: msgId,
+    uuid: msgId,
+    type: "user",
+    message: {
+      role: "user",
+      content: `<cross-session-message from="${from}"${name}${mode}>\n${text}\n</cross-session-message>`,
+    },
+    priority,
+    from,
+  };
+}
+
+export function parseFrame(line) {
+  const frame = JSON.parse(line);
+  if (frame?.type !== "user" || typeof frame.message?.content !== "string") return null;
+  const raw = frame?.message?.content ?? "";
+  const inner = raw.match(/<cross-session-message[^>]*>\n?([\s\S]*?)\n?<\/cross-session-message>/);
+  return {
+    msgId: frame.msg_id ?? null,
+    from: frame.from ?? null,
+    fromSocket: decodePeerAddress(frame.from),
+    text: (inner ? inner[1] : raw).trim(),
+  };
+}
+
+function decodePeerAddress(from) {
+  if (typeof from !== "string" || !from.startsWith("uds:")) return null;
+  try { return decodeURIComponent(from.slice(4)) || null; }
+  catch { return null; }
+}
+
+export function peerKeyPath(pid, socket) {
+  const pipe = /^[\\/]{2}[.?][\\/]pipe[\\/](?:(LOCAL)[\\/])?([^\\/]+)$/i.exec(socket);
+  let canonical;
+  if (pipe && !/[. ]$/.test(pipe[2]) && ![".", ".."].includes(pipe[2])) {
+    canonical = `\\\\.\\pipe\\${pipe[1] ? "local\\" : ""}${pipe[2].replace(/[A-Z]/g, (letter) => letter.toLowerCase())}`;
+  } else if (!IS_WINDOWS && path.isAbsolute(socket)) {
+    canonical = path.resolve(socket);
+  } else {
+    throw new Error("Refusing a non-local or non-canonical peer socket");
+  }
+  return path.join(sessionsDir(), `${pid}.${crypto.createHash("sha256").update(canonical).digest("hex")}.key`);
+}
+
+function readPeerToken(socket) {
+  peerKeyPath(process.pid, socket);
+  const candidates = listClaudeSessions({ includeBridges: true }).filter((entry) => {
+    try { return peerKeyPath(entry.pid, entry.socket) === peerKeyPath(entry.pid, socket); }
+    catch { return false; }
+  });
+  if (candidates.length !== 1) {
+    if (IS_WINDOWS) throw new Error("No unique live session owns the destination inbox; message was not sent");
+    return null;
+  }
+  try {
+    const key = JSON.parse(fs.readFileSync(peerKeyPath(candidates[0].pid, socket), "utf8"));
+    if (typeof key.peerToken !== "string" || !/^[0-9a-f]{32}$/i.test(key.peerToken)) throw new Error("Invalid peer key");
+    const identity = readPeerProcessIdentity(key);
+    const hasIdentity = Object.hasOwn(key, "procStart") || (IS_WINDOWS && Object.hasOwn(key, "procStartFt"));
+    if (!identity && (hasIdentity || (IS_WINDOWS && hardenedBridgeEnabled()))) throw new Error("Peer process identity missing or invalid");
+    if (identity) {
+      const current = readProcessStart(candidates[0].pid);
+      if (current === null) throw new Error("The live peer process identity could not be read; message was not sent. That failure is not itself evidence the process changed.");
+      if (identity !== current) throw new Error("Peer process identity changed");
+    }
+    return key.peerToken;
+  } catch {
+    if (IS_WINDOWS) throw new Error("The destination inbox authentication key is missing or invalid; message was not sent");
+    return null;
+  }
+}
+
+export function readPeerProcessIdentity(entry, platform = process.platform) {
+  if (platform !== "win32") return entry.procStart ?? null;
+  const values = ["procStart", "procStartFt"].filter((field) => Object.hasOwn(entry, field)).map((field) => entry[field]);
+  if (!values.length) return null;
+  if (values.some((value) => typeof value !== "string" || !/^[1-9]\d{0,19}$/.test(value) || BigInt(value) > 18446744073709551615n)
+      || values.some((value) => value !== values[0])) {
+    throw new Error("Invalid or conflicting Windows peer process identity");
+  }
+  return values[0];
+}
+
+const PROCESS_START_TIMEOUT_MS = 30000;
+
+/**
+ * MCP servers are spawned with an empty PATH, so `ps` must be addressed by its
+ * absolute path - a bare lookup throws ENOENT and takes the whole server down
+ * before it can answer the client's initialize call.
+ *
+ * A failed read is reported as null rather than as an empty string, because
+ * the callers compare this against a recorded identity and an empty string
+ * silently compares as "changed". A cold PowerShell on a contended Windows
+ * runner has been measured in this repo between 5s and 15s, so the previous
+ * 3s ceiling turned ordinary slowness into a report that the peer process had
+ * been swapped - the alarming reading of the two, and the one that fails a
+ * send. The budget now matches what the suites already give their own
+ * identity reads.
+ */
+function readProcessStart(pid) {
+  try {
+    if (IS_WINDOWS) {
+      const root = process.env.SystemRoot || process.env.WINDIR;
+      const shell = root ? path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe") : "powershell.exe";
+      return execFileSync(shell, ["-NoProfile", "-NonInteractive", "-Command", `[System.Diagnostics.Process]::GetProcessById(${Number(pid)}).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()`], { timeout: PROCESS_START_TIMEOUT_MS, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
+    }
+    return execFileSync(PS_BIN, ["-o", "lstart=", "-p", String(pid)], { env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, timeout: PROCESS_START_TIMEOUT_MS }).toString().trim();
+  } catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+const SESSION_READ_ATTEMPTS = 3;
+const PEER_SEND_ATTEMPTS = 3;
+const PEER_CONNECT_TIMEOUT_MS = 2000;
+const PEER_VERIFY_TIMEOUT_MS = 30000;
+const PEER_RETRY_DELAY_MS = 75;
+const RETRYABLE_PEER_ERRORS = new Set(["ECONNREFUSED", "ECONNRESET", "ENOENT", "EPIPE", "ENOTFOUND", "ETIMEDOUT"]);
+
+function readSessionEntry(file) {
+  for (let attempt = 0; attempt < SESSION_READ_ATTEMPTS; attempt += 1) {
+    try {
+      const first = fs.readFileSync(file, "utf8");
+      const second = fs.readFileSync(file, "utf8");
+      if (first !== second) continue;
+      return JSON.parse(second);
+    } catch {}
+  }
+  return null;
+}
+
+function hasMessagingEndpoint(entry) {
+  const socket = entry?.messagingSocketPath;
+  if (IS_WINDOWS && typeof socket === "string" && socket.toLowerCase().startsWith("\\\\.\\pipe\\")) return true;
+  return Boolean(socket) && fs.existsSync(socket);
+}
+
+export const BRIDGE_ENTRYPOINT = "codex-bridge";
+
+export function listClaudeSessions({ includeDead = false, includeBridges = false, includeActivity = false } = {}) {
+  const dir = sessionsDir();
+  if (!fs.existsSync(dir)) return [];
+  const rows = [];
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith(".json")) continue;
+    const entry = readSessionEntry(path.join(dir, file));
+    if (!entry) continue;
+    if (!entry?.pid || !entry?.messagingSocketPath) continue;
+    if (entry.entrypoint === BRIDGE_ENTRYPOINT && !includeBridges) continue;
+    const alive = isProcessAlive(entry.pid) && hasMessagingEndpoint(entry);
+    if (!alive && !includeDead) continue;
+    let processStart;
+    try { processStart = readPeerProcessIdentity(entry); }
+    catch { continue; }
+    rows.push({
+      pid: entry.pid,
+      name: entry.name ?? null,
+      sessionId: entry.sessionId ?? null,
+      bridgeSessionId: entry.bridgeSessionId ?? null,
+      cwd: entry.cwd ?? null,
+      kind: entry.kind ?? null,
+      entrypoint: entry.entrypoint ?? null,
+      startedAt: entry.startedAt ?? null,
+      ...(includeActivity && typeof entry.status === "string" && entry.status.length <= 64 ? { activity: entry.status } : {}),
+      processStart,
+      socket: entry.messagingSocketPath,
+      alive,
+    });
+  }
+  return rows.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
+}
+
+export function findClaudeSession(target, { desktopOnly = false, expectedCwd } = {}) {
+  const sessions = listClaudeSessions();
+  const needle = String(target).trim();
+  if (desktopOnly) {
+    const byId = sessions.filter((session) => String(session.pid) === needle || session.sessionId === needle);
+    const matches = byId.length ? byId : sessions.filter((session) => session.name === needle);
+    if (!needle || matches.length === 0) return null;
+    if (matches.length !== 1) throw new Error(`Desktop-only mode requires an unambiguous sessionId or pid; "${needle}" matches multiple sessions. No message was sent.`);
+    const session = matches[0];
+    if (session.entrypoint !== "claude-desktop") {
+      throw Object.assign(new Error(`Desktop-only mode refuses Claude session ${session.sessionId ?? session.pid} with entrypoint ${session.entrypoint ?? "unknown"}. Inspect native session discovery; do not open chats to load a relay or launch a replacement CLI session. No message was sent.`), { code: "CLAUDE_DESKTOP_TASK_UNVERIFIED", sent: false });
+    }
+    if (expectedCwd !== undefined) assertClaudeSessionCwd(session, expectedCwd);
+    return session;
+  }
+  return (
+    sessions.find((s) => String(s.pid) === needle) ??
+    sessions.find((s) => s.sessionId === needle) ??
+    sessions.find((s) => s.name === needle) ??
+    sessions.find((s) => (s.name ?? "").toLowerCase().includes(needle.toLowerCase())) ??
+    null
+  );
+}
+
+export function assertClaudeSessionCwd(session, expectedCwd) {
+  if (typeof expectedCwd !== "string" || !path.isAbsolute(expectedCwd) || !session.cwd || !path.isAbsolute(session.cwd)) {
+    throw new Error("Desktop delivery requires an explicit absolute expectedCwd and an absolute session cwd. No message was sent.");
+  }
+  let expected;
+  let actual;
+  try {
+    expected = fs.realpathSync.native(expectedCwd);
+    actual = fs.realpathSync.native(session.cwd);
+  } catch {
+    throw new Error("The intended project directory or the Claude session cwd no longer exists. No message was sent.");
+  }
+  const normalize = (value) => IS_WINDOWS ? value.toLowerCase() : value;
+  if (normalize(expected) !== normalize(actual)) {
+    throw new Error(`Claude session cwd ${actual} does not match expectedCwd ${expected}. No message was sent.`);
+  }
+}
+
+export function assertClaudeSessionProcess(session) {
+  const changed = "The live Claude process identity is missing or changed. No message was sent; inspect list_claude_sessions without opening an app or chat.";
+  if (!session?.alive || typeof session.processStart !== "string" || !session.processStart) throw Object.assign(new Error(changed), { code: "CLAUDE_PROCESS_IDENTITY_CHANGED", sent: false });
+  const current = readProcessStart(session.pid);
+  if (current === null) {
+    throw Object.assign(new Error("The live Claude process identity could not be read, so this send was refused rather than sent unverified. That failure is not itself evidence the session changed; inspect native session discovery before retrying."), { code: "CLAUDE_PROCESS_IDENTITY_UNAVAILABLE", sent: false });
+  }
+  if (current !== session.processStart) throw Object.assign(new Error(changed), { code: "CLAUDE_PROCESS_IDENTITY_CHANGED", sent: false });
+}
+
+/**
+ * Claude Code stores a transcript at ~/.claude/projects/<slug>/<sessionId>.jsonl
+ * where the slug rewrites more than just path separators (/mnt/dev_disk ->
+ * -mnt-dev-disk, losing the underscore), so the file is located by scanning
+ * rather than by reconstructing the slug.
+ */
+function findTranscriptFile(sessionId, cwd) {
+  if (typeof sessionId !== "string" || !sessionId || sessionId.length > 128 || /[^a-zA-Z0-9_-]/.test(sessionId)) return null;
+  const dir = projectsDir();
+  const guess = path.join(dir, String(cwd ?? "").replace(/[^a-zA-Z0-9]/g, "-"), `${sessionId}.jsonl`);
+  if (fs.existsSync(guess)) return guess;
+  if (!fs.existsSync(dir)) return guess;
+  for (const project of fs.readdirSync(dir)) {
+    const candidate = path.join(dir, project, `${sessionId}.jsonl`);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return guess;
+}
+
+export function readTranscript(sessionId, cwd, limit = 10) {
+  const file = findTranscriptFile(sessionId, cwd);
+  if (!file || !fs.existsSync(file)) return { file, messages: [] };
+  const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+  const messages = [];
+  for (const line of lines) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const role = entry?.message?.role;
+    if (role !== "user" && role !== "assistant") continue;
+    if (entry.isMeta || entry.isSidechain) continue;
+    const content = entry?.message?.content;
+    const text = Array.isArray(content)
+      ? content
+          .filter((c) => c?.type === "text")
+          .map((c) => c.text ?? "")
+          .join("\n")
+      : String(content ?? "");
+    if (!text.trim()) continue;
+    messages.push({ role, text: text.trim() });
+  }
+  return { file, messages: messages.slice(-limit) };
+}
+
+/**
+ * Claude Code records an injected peer message in one of two shapes. An idle
+ * recipient starts a new turn with a user entry whose uuid is the message id
+ * (origin.msg_id names it as well). A busy recipient absorbs the message into
+ * the running turn instead: the entry is a queued_command attachment under a
+ * fresh uuid, and the reply is that turn's closing text. The peer origin's
+ * msg_id identifies the message; source_uuid is unrelated on 2.1.229-2.1.237
+ * and equals the message id on the measured 2.1.260-2.1.263 builds.
+ */
+function injectedMessageRoot(entry, msgId) {
+  if (typeof entry.uuid !== "string" || !entry.uuid.trim()) return null;
+  const matchesOrigin = (origin) => origin?.kind === "peer" && origin.msg_id === msgId;
+  if (entry.message?.role === "user") {
+    if (entry.origin !== undefined && !matchesOrigin(entry.origin)) return null;
+    if (entry.uuid === msgId || matchesOrigin(entry.origin)) return "idle";
+  }
+  const attachment = entry.type === "attachment" ? entry.attachment : null;
+  if (attachment?.type === "queued_command" && matchesOrigin(attachment.origin)) return "absorbed";
+  return null;
+}
+
+function isOtherPeerInput(entry, msgId) {
+  const origin = entry.origin;
+  return origin?.kind === "peer" && typeof origin.msg_id === "string"
+    && origin.msg_id.trim().length > 0 && origin.msg_id !== msgId;
+}
+
+function isInterruptedDelivery(receipt) {
+  return receipt?.status === "interrupted" && receipt.source === "transcript"
+    && receipt.reasonCode === "CLAUDE_REPLY_INTERRUPTED"
+    && typeof receipt.inReplyTo === "string" && receipt.inReplyTo.length > 0
+    && Number.isFinite(receipt.observedAt)
+    && Array.isArray(receipt.interruptedBy) && receipt.interruptedBy.length > 0
+    && receipt.interruptedBy.every((id) => typeof id === "string" && id.trim())
+    && Array.isArray(receipt.backgroundTaskIds)
+    && receipt.backgroundTaskIds.every((id) => typeof id === "string" && id.trim());
+}
+
+function isTerminalDelivery(receipt) {
+  return ["refused", "denied", "expired", "dropped"].includes(receipt?.status) || isInterruptedDelivery(receipt);
+}
+
+function resumableTranscriptDelivery(id, sent, receipt) {
+  const uuid = value => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  const session = sent?.transcriptSession;
+  return Boolean(sent) && uuid(id) && !sent.reply && !sent.failed && !isTerminalDelivery(receipt)
+    && Number.isFinite(sent.sentAt) && (!receipt || receipt.status === "delivered" && receipt.fromSocket === sent.targetSocket)
+    && session?.entrypoint === "claude-desktop" && uuid(session.sessionId)
+    && typeof session.cwd === "string" && path.isAbsolute(session.cwd)
+    && typeof sent.targetSocket === "string" && sent.targetSocket && session.socket === sent.targetSocket
+    && session.desktop?.status === "matched" && typeof session.desktop.taskId === "string"
+    && session.desktop.taskId.startsWith("local_") && uuid(session.desktop.taskId.slice(6))
+    && session.desktop.cwd === session.cwd
+    && /^[a-f0-9]{64}$/i.test(sent.accountContext?.claude ?? "") && /^[a-f0-9]{64}$/i.test(sent.accountContext?.codex ?? "")
+    && session.desktop.accountFingerprint === sent.accountContext.claude
+    && hasTranscriptDeliveryRoot(session.sessionId, session.cwd, id);
+}
+
+function hasTranscriptDeliveryRoot(sessionId, cwd, msgId) {
+  const file = findTranscriptFile(sessionId, cwd);
+  if (!file) return false;
+  let lines;
+  try { lines = fs.readFileSync(file, "utf8").split("\n"); }
+  catch { return false; }
+  let roots = 0;
+  const ids = new Set();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { return false; }
+    if (!entry || typeof entry !== "object" || entry.isSidechain) continue;
+    if (typeof entry.uuid === "string") {
+      if (ids.has(entry.uuid)) return false;
+      ids.add(entry.uuid);
+    }
+    if (!injectedMessageRoot(entry, msgId)) continue;
+    if (entry.entrypoint !== "claude-desktop" || entry.sessionId !== sessionId || entry.cwd !== cwd) return false;
+    roots++;
+  }
+  return roots === 1;
+}
+
+export function readTranscriptReply(sessionId, cwd, msgId) {
+  return readTranscriptOutcome(sessionId, cwd, msgId)?.reply ?? null;
+}
+
+// Read(image) adds a native user-role companion after its tool result (and
+// sometimes hooks). It describes image scaling, not a new user command.
+// Require the actual image-result ancestry; matching text alone is not proof.
+function isImageToolCompanion(entry, entriesById) {
+  if (entry.type !== "user" || entry.message?.role !== "user"
+      || entry.isMeta !== true || entry.turnCompanion !== true
+      || entry.origin != null || entry.promptSource != null || entry.turnOrigin != null
+      || typeof entry.promptId !== "string" || !entry.promptId
+      || typeof entry.sessionId !== "string" || !entry.sessionId
+      || typeof entry.message.content !== "string") return false;
+  let result = entriesById.get(entry.parentUuid);
+  for (let i = 0; i < 8 && result?.type === "attachment"
+      && ["hook_success", "total_tokens_reminder"].includes(result.attachment?.type); i++) {
+    result = entriesById.get(result.parentUuid);
+  }
+  const call = entriesById.get(result?.parentUuid);
+  return result?.type === "user" && result.message?.role === "user"
+    && result.promptId === entry.promptId && result.sessionId === entry.sessionId
+    && result.toolUseResult?.type === "image"
+    && result.sourceToolAssistantUUID === call?.uuid
+    && call?.message?.role === "assistant" && call.sessionId === entry.sessionId
+    && Array.isArray(result.message.content) && result.message.content.length === 1
+    && result.message.content.every(part => part?.type === "tool_result" && !part.is_error
+      && Array.isArray(part.content) && part.content.some(block => block?.type === "image")
+      && Array.isArray(call.message.content) && call.message.content.some(tool =>
+        tool?.type === "tool_use" && tool.name === "Read"
+        && typeof tool.id === "string" && tool.id === part.tool_use_id));
+}
+
+function compactContinuation(entry, root, entriesById, transcriptIds, sessionId, cwd) {
+  if (entry.type !== "system" || entry.subtype !== "compact_boundary" || entry.parentUuid !== null
+      || typeof entry.logicalParentUuid !== "string") return null;
+  const sameIdentity = (record) => record?.entrypoint === "claude-desktop"
+    && record.sessionId === sessionId && record.cwd === root.cwd;
+  if (!sameIdentity(root) || !sameIdentity(entry) || typeof root.cwd !== "string"
+      || path.resolve(root.cwd) !== path.resolve(cwd)) return null;
+  const segment = entry.compactMetadata?.preservedSegment;
+  const preserved = entry.compactMetadata?.preservedMessages;
+  const ids = preserved?.uuids;
+  const allIds = preserved?.allUuids;
+  if (!Array.isArray(ids) || !ids.length || ids.length > 65536
+      || ids.some((id) => typeof id !== "string" || !id) || new Set(ids).size !== ids.length
+      || !Array.isArray(allIds) || !allIds.length || allIds.length > 65536
+      || allIds.some((id) => typeof id !== "string" || !id.trim()) || new Set(allIds).size !== allIds.length
+      || !ids.includes(root.uuid) || segment?.headUuid !== ids[0]
+      || segment.tailUuid !== ids.at(-1) || segment.tailUuid !== entry.logicalParentUuid
+      || typeof segment.anchorUuid !== "string" || preserved.anchorUuid !== segment.anchorUuid) return null;
+  const persistedIds = allIds.filter((id) => transcriptIds.has(id));
+  if (persistedIds.length !== ids.length || ids.some((id, index) => persistedIds[index] !== id)) return null;
+  if (ids.some((id, index) => !sameIdentity(entriesById.get(id))
+      || index > 0 && entriesById.get(id).parentUuid !== ids[index - 1])
+      || ids.includes(entriesById.get(ids[0]).parentUuid)) return null;
+  const summary = entriesById.get(segment.anchorUuid);
+  if (!sameIdentity(summary) || summary.type !== "user" || summary.message?.role !== "user"
+      || summary.isCompactSummary !== true || summary.isVisibleInTranscriptOnly !== true
+      || summary.turnOrigin !== "peer" || summary.origin != null || summary.promptSource != null) return null;
+  let ancestor = entriesById.get(summary.parentUuid);
+  for (let depth = 0; depth < 64 && ancestor?.type === "attachment"; depth++) {
+    if (!sameIdentity(ancestor)) return null;
+    ancestor = entriesById.get(ancestor.parentUuid);
+  }
+  return ancestor === entry ? summary.uuid : null;
+}
+
+// Interruption closes reply observation, not execution. Never attach a later
+// user turn's answer to the original request or claim its side effects stopped.
+export function readTranscriptOutcome(sessionId, cwd, msgId) {
+  const file = findTranscriptFile(sessionId, cwd);
+  if (!file) return null;
+  let lines;
+  try { lines = fs.readFileSync(file, "utf8").split("\n"); }
+  catch { return null; }
+  const entries = [];
+  const roots = [];
+  const ids = new Set();
+  const transcriptIds = new Set();
+  let ambiguous = false;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { ambiguous = true; continue; }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    if (typeof entry.uuid === "string") transcriptIds.add(entry.uuid);
+    if (entry.isSidechain) continue;
+    if (typeof entry.uuid === "string") {
+      if (ids.has(entry.uuid)) ambiguous = true;
+      ids.add(entry.uuid);
+    }
+    entries.push(entry);
+    const root = injectedMessageRoot(entry, msgId);
+    if (root) roots.push({ entry, absorbed: root === "absorbed" });
+  }
+  if (roots.length !== 1) return null;
+  const { entry: root, absorbed } = roots[0];
+  const entriesById = new Map(entries.map((entry) => [entry.uuid, entry]));
+  const orderedEntries = ambiguous ? entries : [];
+  if (!ambiguous) {
+    // Claude can persist a reply before its parent attachment; visit late
+    // ancestors before their children instead of assuming append order.
+    const visited = new Set();
+    for (const entry of entries) {
+      const ancestors = [];
+      const visiting = new Set();
+      let ancestor = entry;
+      while (ancestor && !visited.has(ancestor)) {
+        if (visiting.has(ancestor)) return null;
+        visiting.add(ancestor);
+        ancestors.push(ancestor);
+        ancestor = typeof ancestor.parentUuid === "string" ? entriesById.get(ancestor.parentUuid) : null;
+      }
+      while (ancestors.length) {
+        const ancestor = ancestors.pop();
+        visited.add(ancestor);
+        orderedEntries.push(ancestor);
+      }
+    }
+  }
+  const descendants = new Map();
+  const monitorTasksByEntry = new Map();
+  const backgroundCalls = new Map();
+  const openLeaves = new Set();
+  const passiveLeaves = new Set();
+  const interruptions = [];
+  const compactSummaries = new Set();
+  const interrupt = (entry, outstanding) => {
+    if (typeof entry.uuid !== "string" || !entry.uuid.trim()) return;
+    openLeaves.delete(entry.parentUuid);
+    interruptions.push({ entryId: entry.uuid, backgroundTaskIds: [...outstanding.keys()] });
+  };
+  for (const entry of orderedEntries) {
+    if (entry === root) { descendants.set(entry.uuid, new Map()); monitorTasksByEntry.set(entry.uuid, new Set()); openLeaves.add(entry.uuid); continue; }
+    let parentUuid = entry.parentUuid;
+    if (!ambiguous && !interruptions.length && descendants.has(entry.logicalParentUuid)
+        && openLeaves.has(entry.logicalParentUuid)) {
+      const summaryId = compactContinuation(entry, root, entriesById, transcriptIds, sessionId, cwd);
+      if (summaryId) {
+        parentUuid = entry.logicalParentUuid;
+        compactSummaries.add(summaryId);
+      }
+    }
+    if (!descendants.has(parentUuid)) continue;
+    let taskNotification = null;
+    if (entry.type === "attachment" && entry.attachment?.type === "queued_command") {
+      // Only a native command record is a boundary. Its text is never used as
+      // proof of authorization, cancellation, or successful task completion.
+      if (entry.attachment.commandMode === "prompt") {
+        interrupt(entry, descendants.get(entry.parentUuid));
+        continue;
+      }
+      // Inline native notifications preserve the chain; only matching task and
+      // tool-call identities below can complete an outstanding command.
+      if (entry.attachment.commandMode !== "task-notification"
+        || entry.attachment.origin?.kind !== "task-notification"
+        || entry.attachment.origin?.producer !== "session-task") continue;
+      taskNotification = entry.attachment.prompt;
+    }
+    const role = entry.message?.role;
+    const content = entry.message?.content;
+    const outstanding = new Map(descendants.get(parentUuid));
+    const monitorTasks = new Set(monitorTasksByEntry.get(parentUuid));
+    const toolResults = Array.isArray(content) && content.length > 0 && content.every((part) => part?.type === "tool_result");
+    const imageCompanion = isImageToolCompanion(entry, entriesById);
+    if (role === "user" && !toolResults && !imageCompanion && !compactSummaries.has(entry.uuid)) {
+      const notificationText = typeof content === "string" ? content
+        : Array.isArray(content) ? content.filter((part) => typeof part?.text === "string").map((part) => part.text).join("\n") : "";
+      const nativeHuman = entry.origin?.kind === "human" && entry.promptSource === "sdk" && entry.turnOrigin === "human";
+      const legacyInput = entry.origin == null && entry.promptSource == null && entry.turnOrigin == null;
+      const ordinaryInput = !entry.isMeta && (nativeHuman || legacyInput)
+        && !notificationText.includes("<task-notification>")
+        && (typeof content === "string" && content.trim()
+          || Array.isArray(content) && content.length > 0 && content.every((part) => part?.type === "text" && typeof part.text === "string")
+            && content.some((part) => part.text.trim()));
+      if (ordinaryInput || isOtherPeerInput(entry, msgId)) {
+        interrupt(entry, outstanding);
+        continue;
+      }
+      // A background command can end one model turn, then resume it through a
+      // native task notification. Only that correlated system event may cross
+      // the user-message boundary; pasted notification text is never enough.
+      if (entry.origin?.kind !== "task-notification" || entry.origin.producer !== "session-task"
+        || entry.promptSource !== "system" || entry.turnOrigin !== "task_notification"
+        || typeof content !== "string" || !/^<task-notification>\s[\s\S]*<\/task-notification>$/.test(content.trim())) continue;
+      taskNotification = content;
+    }
+    if (typeof taskNotification === "string" && /^<task-notification>\s[\s\S]*<\/task-notification>$/.test(taskNotification.trim())) {
+      const field = (name) => {
+        if (taskNotification.split(`<${name}>`).length !== 2 || taskNotification.split(`</${name}>`).length !== 2) return null;
+        const matches = [...taskNotification.matchAll(new RegExp(`<${name}>([^<>]+)</${name}>`, "g"))];
+        return matches.length === 1 ? matches[0][1] : null;
+      };
+      const taskId = field("task-id");
+      const hasField = name => taskNotification.split(`<${name}>`).length === 2
+        && taskNotification.split(`</${name}>`).length === 2
+        && new RegExp(`<${name}>[\\s\\S]+?</${name}>`).test(taskNotification);
+      const monitorProgress = monitorTasks.has(taskId) && !outstanding.has(taskId)
+        && hasField("summary") && hasField("event")
+        && !/<\/?(?:status|tool-use-id)(?:\s|>)/.test(taskNotification);
+      if (!outstanding.has(taskId) || outstanding.get(taskId) !== field("tool-use-id")
+        || !["completed", "failed", "killed"].includes(field("status"))) {
+        if (role === "user" && !monitorProgress) continue;
+      } else outstanding.delete(taskId);
+    }
+    if (typeof entry.uuid !== "string" || !entry.uuid.trim()) continue;
+    if (role === "assistant" && Array.isArray(content)) {
+      for (const part of content) {
+        if (part?.type === "tool_use" && ["Bash", "PowerShell"].includes(part.name)
+          && typeof part.id === "string") backgroundCalls.set(part.id, entry.uuid);
+      }
+    }
+    const taskId = entry.toolUseResult?.backgroundTaskId;
+    if (role === "user" && toolResults && typeof taskId === "string" && /^[\w-]{1,128}$/.test(taskId)) {
+      const matches = content.filter((part) => !part.is_error && backgroundCalls.get(part.tool_use_id) === entry.parentUuid);
+      if (matches.length === 1) outstanding.set(taskId, matches[0].tool_use_id);
+    }
+    descendants.set(entry.uuid, outstanding);
+    // Parallel tool results and hook records can be leaf siblings of the real
+    // continuation. They are completed observations, not separate reply turns.
+    const parentEntry = entriesById.get(entry.parentUuid);
+    const monitorTaskId = entry.toolUseResult?.taskId;
+    if (role === "user" && toolResults && content.length === 1 && typeof monitorTaskId === "string" && /^[\w-]{1,128}$/.test(monitorTaskId)
+      && entry.sourceToolAssistantUUID === parentEntry?.uuid
+      && parentEntry?.message?.role === "assistant"
+      && Number.isSafeInteger(entry.toolUseResult.timeoutMs) && entry.toolUseResult.timeoutMs > 0
+      && typeof entry.toolUseResult.persistent === "boolean") {
+      const matches = content.filter(part => !part.is_error && typeof part.tool_use_id === "string" && part.tool_use_id
+        && Array.isArray(parentEntry.message.content)
+        && parentEntry.message.content.filter(call => call.type === "tool_use" && call.name === "Monitor" && call.id === part.tool_use_id).length === 1);
+      if (matches.length === 1) monitorTasks.add(monitorTaskId);
+    }
+    monitorTasksByEntry.set(entry.uuid, monitorTasks);
+    const matchedResults = toolResults && !entry.toolUseResult?.backgroundTaskId
+      && content.every((part) => Array.isArray(parentEntry?.message?.content)
+        && parentEntry.message.content.some((call) => call.type === "tool_use" && call.id === part.tool_use_id));
+    if (matchedResults || imageCompanion || entry.type === "attachment"
+      && ["hook_success", "total_tokens_reminder", "deferred_tools_record"].includes(entry.attachment?.type)) {
+      passiveLeaves.add(entry.uuid);
+    }
+    openLeaves.delete(parentUuid);
+    openLeaves.add(entry.uuid);
+    if (role !== "assistant" || !["end_turn", "stop_sequence"].includes(entry.message.stop_reason)) continue;
+    if (outstanding.size > 0) continue;
+    const text = Array.isArray(content) ? content.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n") : typeof content === "string" ? content : "";
+    if (text.trim()) return { status: "reply_received", reply: { text: text.trim(), msgId: entry.uuid, source: "transcript", inReplyTo: msgId, absorbed } };
+  }
+  if (!ambiguous && interruptions.length && [...openLeaves].every((id) => passiveLeaves.has(id))) {
+    return { status: "interrupted", source: "transcript", inReplyTo: msgId,
+      reasonCode: "CLAUDE_REPLY_INTERRUPTED",
+      reason: "A new conversation command separated this request from later replies. Reply waiting ended; the original task outcome is unknown and any background work may still be running. Inspect the existing task before sending a follow-up; do not resend the original action.",
+      interruptedBy: interruptions.map((entry) => entry.entryId),
+      backgroundTaskIds: [...new Set(interruptions.flatMap((entry) => entry.backgroundTaskIds))],
+    };
+  }
+  return null;
+}
+
+const RELOAD_DRAIN_MS = 1000;
+
+/**
+ * Registers this process as a peer that Claude sessions can see in their agent
+ * list and reply to. Without a registered socket, Claude has no address to
+ * answer on and the conversation stays one-way.
+ */
+export class PeerEndpoint {
+  constructor({ name = `codex-${process.pid}`, cwd = process.cwd(), log = () => {}, env = process.env, protectSocket, signalExit = true } = {}) {
+    this.name = name;
+    this.cwd = cwd;
+    this.log = log;
+    this.pid = process.pid;
+    this.socketPath = peerSocketPath(this.pid);
+    this.registryPath = path.join(sessionsDir(), `${this.pid}.json`);
+    this.keyPath = null;
+    this.server = null;
+    this.inbox = [];
+    this.listeners = new Set();
+    this.messageSequence = 0;
+    this.requestQueues = new Map();
+    this.unconfirmedReplies = new Map();
+    this.started = false;
+    this.peerToken = null;
+    this.permissionMode = process.env.CLAUDE_BRIDGE_PERMISSION_MODE;
+    this.deliveryReceipts = new Map();
+    this.sentMessages = new Map();
+    this.pendingMessages = new Map();
+    this.responsePoll = null;
+    this.transcriptPollingPaused = false;
+    this.connections = new Set();
+    this.activityRevision = 0;
+    this.reloadPaused = false;
+    this.intakeClosed = false;
+    this.processHandlersRegistered = false;
+    this.signalExit = signalExit;
+    this.strict = hardenedBridgeEnabled(env);
+    this.protectSocket = protectSocket ?? (hardenedBridgeEnabled(env) ? protectCurrentUserPipe : null);
+    this.aclReady = !IS_WINDOWS || !this.protectSocket;
+    this.provisionalSockets = new Set();
+    this.startGeneration = 0;
+    this.startPromise = null;
+    this.closed = Promise.resolve();
+  }
+
+  /**
+   * A bridge killed with SIGKILL leaves its registry entry and socket behind,
+   * and Claude then lists a crowd of dead peers with the same name. Sweep the
+   * leftovers of previous bridge runs before advertising this one.
+   */
+  #sweepDeadBridges() {
+    const dir = sessionsDir();
+    if (!fs.existsSync(dir)) return;
+    for (const file of fs.readdirSync(dir)) {
+      if (!file.endsWith(".json")) continue;
+      const registry = path.join(dir, file);
+      const entry = readSessionEntry(registry);
+      if (!entry) continue;
+      if (entry?.entrypoint !== BRIDGE_ENTRYPOINT) continue;
+      if (!entry.pid || entry.pid === this.pid || isProcessAlive(entry.pid)) continue;
+      for (const stale of [registry, entry.messagingSocketPath, ...fs.readdirSync(dir)
+        .filter((f) => f.startsWith(`${entry.pid}.`) && f.endsWith(".key"))
+        .map((f) => path.join(dir, f))]) {
+        if (!stale) continue;
+        try {
+          fs.rmSync(stale, { force: true });
+        } catch {}
+      }
+      this.log(`swept dead bridge peer pid ${entry.pid}`);
+    }
+  }
+
+  start() {
+    if (this.reloadPaused) throw new Error("The peer endpoint is quiesced for reload");
+    if (this.intakeClosed) throw new Error("The peer endpoint is shutting down because its MCP client closed");
+    if (this.started) return;
+    if (this.startPromise) return this.startPromise;
+    const starting = this.#startOnce();
+    const shared = starting.finally(() => {
+      if (this.startPromise === shared) this.startPromise = null;
+    });
+    this.startPromise = shared;
+    return shared;
+  }
+
+  async #startOnce() {
+    this.#sweepDeadBridges();
+    const procStart = readProcessStart(this.pid) ?? "";
+    const peerToken = crypto.randomBytes(16).toString("hex");
+    this.peerToken = peerToken;
+    this.keyPath = peerKeyPath(this.pid, this.socketPath);
+
+    if (!IS_WINDOWS) fs.mkdirSync(SOCKET_DIR, { recursive: true });
+    fs.mkdirSync(sessionsDir(), { recursive: true });
+    if (!IS_WINDOWS && fs.existsSync(this.socketPath)) fs.rmSync(this.socketPath, { force: true });
+
+    const generation = ++this.startGeneration;
+    this.aclReady = !IS_WINDOWS || !this.protectSocket;
+    await new Promise((resolve, reject) => {
+      this.server = net.createServer((socket) => this.#handleConnection(socket));
+      this.server.on("error", reject);
+      this.server.listen(this.socketPath, resolve);
+    });
+    if (!IS_WINDOWS) fs.chmodSync(this.socketPath, 0o600);
+    if (IS_WINDOWS && this.protectSocket) {
+      try {
+        await this.protectSocket(this.socketPath);
+        if (generation !== this.startGeneration) throw new Error("Peer pipe ACL startup was cancelled");
+        this.aclReady = true;
+        for (const socket of this.provisionalSockets) socket.destroy();
+        this.provisionalSockets.clear();
+      } catch (error) {
+        for (const socket of this.provisionalSockets) socket.destroy();
+        this.provisionalSockets.clear();
+        await this.#closeServer();
+        throw error;
+      }
+    }
+    if (generation !== this.startGeneration) {
+      for (const socket of this.provisionalSockets) socket.destroy();
+      this.provisionalSockets.clear();
+      await this.#closeServer();
+      throw new Error("Peer endpoint startup was cancelled");
+    }
+
+    const processIdentity = procStart ? (IS_WINDOWS ? { procStart, procStartFt: procStart } : { procStart }) : {};
+    this.registry = {
+      pid: this.pid,
+      sessionId: crypto.randomUUID(),
+      cwd: this.cwd,
+      startedAt: Date.now(),
+      ...processIdentity,
+      version: CLAUDE_VERSION_HINT,
+      peerProtocol: PEER_PROTOCOL_VERSION,
+      kind: "interactive",
+      entrypoint: BRIDGE_ENTRYPOINT,
+      messagingSocketPath: this.socketPath,
+      name: this.name,
+      nameSource: "derived",
+    };
+    fs.writeFileSync(this.registryPath, JSON.stringify(this.registry), { mode: 0o600 });
+    fs.writeFileSync(this.keyPath, JSON.stringify({ peerToken, ...processIdentity }), { mode: 0o600 });
+
+    if (!this.processHandlersRegistered) {
+      for (const signal of this.signalExit ? ["SIGINT", "SIGTERM"] : []) {
+        process.on(signal, () => {
+          this.stop();
+          process.exit(0);
+        });
+      }
+      process.on("exit", () => this.stop());
+      this.processHandlersRegistered = true;
+    }
+
+    this.started = true;
+    this.transcriptPollingPaused = false;
+    this.#startTranscriptPolling();
+    this.log(`peer "${this.name}" listening on ${this.socketPath}`);
+  }
+
+  #closeServer() {
+    const server = this.server;
+    return new Promise((resolve) => {
+      if (!server) return resolve();
+      try {
+        if (!server.listening) return resolve();
+        server.close(() => resolve());
+      } catch {
+        resolve();
+      }
+    });
+  }
+
+  #handleConnection(socket) {
+    if (IS_WINDOWS && !this.aclReady) {
+      this.provisionalSockets.add(socket);
+      socket.once("close", () => this.provisionalSockets.delete(socket));
+      socket.once("error", () => {});
+      return;
+    }
+    this.activityRevision += 1;
+    this.connections.add(socket);
+    socket.once("close", () => this.connections.delete(socket));
+    if (this.reloadPaused) { socket.destroy(); return; }
+    let buffer = "";
+    let authenticated = false;
+    let firstLine = true;
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      this.activityRevision += 1;
+      if (this.reloadPaused) { socket.destroy(); return; }
+      buffer += chunk;
+      if (buffer.length > 1048576) { socket.destroy(); return; }
+      let index;
+      while ((index = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, index).trim();
+        buffer = buffer.slice(index + 1);
+        if (!line) {
+          if (IS_WINDOWS && !authenticated) { socket.destroy(); return; }
+          continue;
+        }
+        let message;
+        try {
+          const frame = JSON.parse(line);
+          if (firstLine && frame?.type === "auth") {
+            firstLine = false;
+            const supplied = typeof frame.token === "string" ? Buffer.from(frame.token) : Buffer.alloc(0);
+            const expected = Buffer.from(this.peerToken ?? "");
+            authenticated = expected.length > 0 && supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+            if (!authenticated) { socket.destroy(); return; }
+            continue;
+          }
+          firstLine = false;
+          if (IS_WINDOWS && !authenticated) { socket.destroy(); return; }
+          if (frame?.type === "control" && frame.action === "peer_message_status") {
+            if (typeof frame.orig_msg_id === "string" && typeof frame.from === "string") {
+              const receipt = {
+                status: frame.status_detail === "refused" ? "refused" : frame.status,
+                reason: typeof frame.reason === "string" ? frame.reason : "",
+                fromSocket: decodePeerAddress(frame.from),
+              };
+              // This status is derived locally from transcript ancestry, never
+              // accepted as a peer assertion that releases pending ownership.
+              if (receipt.status === "interrupted") continue;
+              const pending = this.pendingMessages.get(frame.orig_msg_id);
+              if (pending?.targetSocket === receipt.fromSocket) {
+                this.deliveryReceipts.set(frame.orig_msg_id, receipt);
+                if (["refused", "denied", "expired", "dropped"].includes(receipt.status)) this.#removePendingReply(receipt.fromSocket, frame.orig_msg_id);
+              }
+            }
+            continue;
+          }
+          message = parseFrame(line);
+        } catch {
+          if (IS_WINDOWS && !authenticated) { socket.destroy(); return; }
+          this.log("ignored malformed peer frame");
+          continue;
+        }
+        if (!message) continue;
+        this.#receiveMessage(message);
+      }
+    });
+    socket.on("error", (err) => this.log(`peer socket error: ${err.message}`));
+  }
+
+  #receiveMessage(message) {
+    const key = message.inReplyTo ?? [...this.pendingMessages].find(([, entry]) => entry.targetSocket === message.fromSocket)?.[0];
+    const pending = this.pendingMessages.get(key);
+    const correlated = pending && (!pending.transcriptSession || (message.source === "transcript" && message.inReplyTo === key));
+    if (this.strict && !(key && correlated && pending.targetSocket === message.fromSocket)) {
+      this.log(`ignored uncorrelated inbound peer message from ${message.fromSocket ?? "?"} in hardened mode`);
+      return;
+    }
+    const record = { ...message };
+    if (key && correlated && pending.targetSocket === record.fromSocket) {
+      const sent = this.sentMessages.get(key);
+      if (sent) {
+        record.inReplyTo = key;
+        record.replyThreadId = sent.replyThreadId ?? null;
+        record.accountContext = sent.accountContext ?? null;
+        record.cwd = sent.transcriptSession?.cwd ?? null;
+        record.senderCwd = sent.scopeBindings?.sender?.path ?? null;
+        record.scopeBindings = sent.scopeBindings ?? null;
+        sent.reply = record;
+      }
+      this.#removePendingReply(record.fromSocket, key);
+    }
+    this.#publishMessage(record);
+  }
+
+  #publishMessage(record) {
+    this.activityRevision += 1;
+    Object.assign(record, { receivedAt: Date.now(), sequence: ++this.messageSequence });
+    this.inbox.push(record);
+    this.log(`inbox <- ${record.fromSocket ?? "?"}: ${record.text.length} characters`);
+    for (const listener of [...this.listeners]) {
+      try { listener(record); }
+      catch (err) { this.log(`peer listener error: ${err.message}`); }
+    }
+  }
+
+  #startTranscriptPolling() {
+    if (this.reloadPaused || this.transcriptPollingPaused || this.responsePoll
+      || ![...this.pendingMessages.values()].some(entry => entry.transcriptSession)) return;
+    this.responsePoll = globalThis.setInterval(() => this.#refreshTranscriptReplies(), 250);
+    this.responsePoll.unref();
+  }
+
+  #refreshTranscriptReplies() {
+    if (this.reloadPaused || this.transcriptPollingPaused) return;
+    for (const [msgId, pending] of this.pendingMessages) {
+      if (!pending.transcriptSession) continue;
+      const { sessionId, cwd } = pending.transcriptSession;
+      const file = findTranscriptFile(sessionId, cwd);
+      if (!file) continue;
+      let stamp;
+      try { const stat = fs.statSync(file, { bigint: true }); stamp = `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.size}`; }
+      catch { continue; }
+      if (stamp === pending.transcriptStamp) continue;
+      pending.transcriptStamp = stamp;
+      const outcome = readTranscriptOutcome(sessionId, cwd, msgId);
+      if (outcome?.reply) this.#receiveMessage({ ...outcome.reply, fromSocket: pending.targetSocket });
+      else if (outcome?.status === "interrupted") {
+        this.deliveryReceipts.set(msgId, { ...outcome, fromSocket: pending.targetSocket, observedAt: Date.now() });
+        this.#removePendingReply(pending.targetSocket, msgId);
+        const sent = this.sentMessages.get(msgId);
+        // A terminal observation is a bridge notification, never a Claude reply.
+        // Retain the send's original routing and scope for inbox filtering and
+        // forwarding; do not infer either from the currently active task.
+        this.#publishMessage({
+          kind: "delivery_status", source: "bridge", status: "interrupted",
+          msgId: `interrupted:${msgId}`, inReplyTo: msgId, fromSocket: pending.targetSocket,
+          replyThreadId: sent?.replyThreadId ?? null, accountContext: sent?.accountContext ?? null,
+          cwd: sent?.transcriptSession?.cwd ?? null, senderCwd: sent?.scopeBindings?.sender?.path ?? null,
+          scopeBindings: sent?.scopeBindings ?? null,
+          outcome: "unknown", waitEnded: true, taskCancelled: false, retrySafe: false,
+          reasonCode: outcome.reasonCode, interruptedBy: outcome.interruptedBy, backgroundTaskIds: outcome.backgroundTaskIds,
+          text: `[Bridge delivery status: ${outcome.reasonCode}]\nMessage id: ${msgId}\n${outcome.reason}`,
+        });
+        this.log(`reply observation interrupted for ${msgId}; task outcome remains unknown`);
+      }
+    }
+    if (![...this.pendingMessages.values()].some((entry) => entry.transcriptSession)) {
+      globalThis.clearInterval(this.responsePoll);
+      this.responsePoll = null;
+    }
+  }
+
+  /**
+   * Codex starts one bridge per session, so several peers advertise at once.
+   * Renaming to the bound thread is what lets a human tell them apart in
+   * Claude's agent list.
+   */
+  rename(name) {
+    if (!name || name === this.name) return this.name;
+    this.name = name;
+    if (this.started && this.registry) {
+      this.registry.name = name;
+      fs.writeFileSync(this.registryPath, JSON.stringify(this.registry), { mode: 0o600 });
+      this.log(`peer renamed to "${name}"`);
+    }
+    return this.name;
+  }
+
+  onMessage(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  async send(targetSocket, text, { priority = "next", msgId, permissionMode = this.permissionMode, beforeSend } = {}) {
+    if (this.reloadPaused) throw new Error("The peer endpoint is quiesced; no message was sent");
+    const frame = buildFrame({ text, fromSocket: this.socketPath, fromName: this.name, priority, permissionMode });
+    if (msgId) frame.uuid = frame.msg_id = msgId;
+    const token = readPeerToken(targetSocket);
+    const line = (token ? JSON.stringify({ type: "auth", token }) + "\n" : "") + JSON.stringify(frame) + "\n";
+    for (let attempt = 1; attempt <= PEER_SEND_ATTEMPTS; attempt += 1) {
+      await beforeSend?.();
+      try {
+        await new Promise((resolve, reject) => {
+          const client = net.connect({ path: targetSocket });
+          this.connections.add(client);
+          client.once("close", () => this.connections.delete(client));
+          let connected = false;
+          let writeStarted = false;
+          let settled = false;
+          let timer;
+          const armTimeout = (phase, duration) => {
+            globalThis.clearTimeout(timer);
+            timer = globalThis.setTimeout(() => {
+              const error = new Error(`timed out ${phase} ${targetSocket}`);
+              error.code = phase === "verifying sender for" ? "PEER_VERIFY_TIMEOUT" : "ETIMEDOUT";
+              finish(error);
+              client.destroy();
+            }, duration);
+          };
+          const finish = (error) => {
+            if (settled) return;
+            settled = true;
+            globalThis.clearTimeout(timer);
+            if (error) {
+              if (writeStarted) error.deliveryUncertain = true;
+              reject({ error, retryable: !connected && !writeStarted });
+            } else {
+              resolve();
+            }
+          };
+          armTimeout("connecting to", PEER_CONNECT_TIMEOUT_MS);
+          client.once("connect", async () => {
+            connected = true;
+            // An established connection must not time out while a long rollout
+            // and native ownership are being verified. Keep a separate bound;
+            // a late verification result still cannot write after settlement.
+            armTimeout("verifying sender for", PEER_VERIFY_TIMEOUT_MS);
+            try {
+              await beforeSend?.();
+              if (settled) return;
+              armTimeout("writing to", PEER_CONNECT_TIMEOUT_MS);
+              writeStarted = true;
+              client.write(line, (error) => {
+                if (error) {
+                  finish(error);
+                  return;
+                }
+                client.end();
+                finish();
+              });
+            } catch (error) {
+              finish(error);
+              client.destroy();
+            }
+          });
+          client.once("error", finish);
+        });
+        return frame.msg_id;
+      } catch (failure) {
+        const error = failure?.error ?? failure;
+        if (!failure?.retryable || attempt === PEER_SEND_ATTEMPTS || !RETRYABLE_PEER_ERRORS.has(error?.code)) {
+          throw error;
+        }
+        await new Promise((resolve) => globalThis.setTimeout(resolve, PEER_RETRY_DELAY_MS));
+      }
+    }
+    return frame.msg_id;
+  }
+
+  async sendAndWait(targetSocket, text, { timeoutMs = 120000, priority = "next", transcriptSession, beforeSend, permissionMode = this.permissionMode, replyThreadId, senderReview, senderApprovalPolicy, recipient, accountContext, scopeBindings } = {}) {
+    const previous = this.requestQueues.get(targetSocket) ?? Promise.resolve();
+    const pending = previous.catch(() => {}).then(async () => {
+      await beforeSend?.();
+      this.#refreshTranscriptReplies();
+      const unconfirmed = this.unconfirmedReplies.get(targetSocket) ?? 0;
+      if (unconfirmed > 0) {
+        const error = new Error(
+          `${unconfirmed} earlier message(s) to ${targetSocket} still await a reply; this message was not sent. `
+          + "Inspect read_claude_delivery and wait for Claude's outstanding replies. Changing waitSec or starting another bridge must not be used to bypass a pending message.",
+        );
+        error.code = "PEER_REPLY_PENDING";
+        error.sent = false;
+        error.msgId = [...this.pendingMessages].find(([, entry]) => entry.targetSocket === targetSocket)?.[0];
+        throw error;
+      }
+      const since = Date.now();
+      const afterSequence = this.messageSequence;
+      this.unconfirmedReplies.set(targetSocket, unconfirmed + 1);
+      let msgId = crypto.randomUUID();
+      this.pendingMessages.set(msgId, { targetSocket, transcriptSession });
+      this.sentMessages.set(msgId, { targetSocket, transcriptSession, sentAt: since, replyThreadId, permissionMode, senderApprovalPolicy, ...(senderReview ? { senderReview: { ...senderReview } } : {}), ...(recipient ? { recipient: { ...recipient } } : {}), ...(accountContext ? { accountContext: Object.freeze({ ...accountContext }) } : {}), ...(scopeBindings ? { scopeBindings: Object.freeze(structuredClone(scopeBindings)) } : {}) });
+      this.#startTranscriptPolling();
+      try {
+        const sentId = await this.send(targetSocket, text, { priority, msgId, permissionMode, beforeSend });
+        if (sentId !== msgId) {
+          const pendingMessage = this.pendingMessages.get(msgId);
+          const earlyReply = this.sentMessages.get(msgId)?.reply;
+          if (earlyReply?.inReplyTo === msgId) earlyReply.inReplyTo = sentId;
+          this.pendingMessages.delete(msgId);
+          this.sentMessages.set(sentId, this.sentMessages.get(msgId));
+          this.sentMessages.delete(msgId);
+          msgId = sentId;
+          if (pendingMessage) this.pendingMessages.set(msgId, pendingMessage);
+        }
+      } catch (err) {
+        const sent = this.sentMessages.get(msgId);
+        if (sent) { sent.error = err.message; sent.errorCode = err.code ?? "CLAUDE_PEER_SEND_FAILED"; }
+        if (!err.deliveryUncertain) {
+          err.sent = false;
+          this.#removePendingReply(targetSocket, msgId);
+          if (sent) sent.failed = true;
+        }
+        err.msgId = msgId;
+        throw err;
+      }
+      const reply = timeoutMs > 0
+        ? await this.waitForReply(targetSocket, { timeoutMs, since, afterSequence, msgId })
+        : null;
+      const delivery = this.deliveryReceipts.get(msgId);
+      if (delivery?.fromSocket === targetSocket) return { msgId, reply, delivery };
+      return { msgId, reply };
+    });
+    this.requestQueues.set(targetSocket, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.requestQueues.get(targetSocket) === pending) this.requestQueues.delete(targetSocket);
+    }
+  }
+
+  #removePendingReply(fromSocket, msgId) {
+    const key = msgId ?? [...this.pendingMessages].find(([, entry]) => entry.targetSocket === fromSocket)?.[0];
+    if (!key || this.pendingMessages.get(key)?.targetSocket !== fromSocket) return;
+    this.pendingMessages.delete(key);
+    const pending = this.unconfirmedReplies.get(fromSocket) ?? 0;
+    if (pending > 1) this.unconfirmedReplies.set(fromSocket, pending - 1);
+    else this.unconfirmedReplies.delete(fromSocket);
+  }
+
+  /**
+   * Claude answers with a fresh msg_id rather than an in-reply-to field, so a
+   * reply is matched by origin socket and arrival time.
+   */
+  waitForReply(fromSocket, { timeoutMs = 120000, since = Date.now(), afterSequence = null, msgId } = {}) {
+    const expectsTranscript = Boolean(msgId && this.sentMessages.get(msgId)?.transcriptSession);
+    const matches = (record) => record.kind !== "delivery_status" && record.fromSocket === fromSocket
+      && (!expectsTranscript || (record.source === "transcript" && record.inReplyTo === msgId))
+      && (!record.inReplyTo || !msgId || record.inReplyTo === msgId)
+      && (afterSequence === null ? record.receivedAt >= since : record.sequence > afterSequence);
+    const existing = this.inbox.find(matches);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve) => {
+      const finish = (reply) => {
+        unsubscribe();
+        globalThis.clearTimeout(timer);
+        globalThis.clearInterval(poll);
+        resolve(reply);
+      };
+      const timer = globalThis.setTimeout(() => finish(null), timeoutMs);
+      const unsubscribe = this.onMessage((record) => {
+        if (!matches(record)) return;
+        finish(record);
+      });
+      const poll = msgId ? globalThis.setInterval(() => {
+        const receipt = this.deliveryReceipts.get(msgId);
+        if (receipt?.fromSocket === fromSocket && (receipt.status === "held" || isTerminalDelivery(receipt))) { finish(null); return; }
+      }, 250) : null;
+    });
+  }
+
+  drainInbox(limit = 20, accepts = () => true) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Inbox limit must be a positive integer");
+    const selected = [];
+    this.inbox = this.inbox.filter((record) => {
+      if (selected.length >= limit || !accepts(record)) return true;
+      selected.push(record);
+      return false;
+    });
+    return selected;
+  }
+
+  readDelivery(msgId) {
+    this.#refreshTranscriptReplies();
+    const sent = this.sentMessages.get(msgId);
+    if (!sent) return null;
+    const delivery = this.deliveryReceipts.get(msgId);
+    const session = sent.transcriptSession;
+    return {
+      msgId,
+      status: sent.reply ? "reply_received" : sent.failed ? "send_failed" : delivery?.status ?? "sent_unconfirmed",
+      reason: delivery?.reason ?? sent.error ?? null,
+      ...(sent.errorCode || delivery?.reasonCode ? { reasonCode: sent.errorCode ?? delivery.reasonCode } : {}),
+      sentAt: sent.sentAt,
+      sessionId: session?.sessionId ?? null,
+      cwd: session?.cwd ?? null,
+      entrypoint: session?.entrypoint ?? null,
+      taskId: session?.desktop?.taskId ?? null,
+      title: session?.desktop?.title ?? null,
+      senderMode: sent.permissionMode ?? null,
+      ...(sent.senderApprovalPolicy !== undefined ? { senderApprovalPolicy: sent.senderApprovalPolicy ?? null } : {}),
+      ...(sent.senderReview ? { senderReview: { ...sent.senderReview } } : {}),
+      ...(sent.recipient ? { recipientPermissionMode: sent.recipient.permissionMode ?? null, recipientPermissionClass: sent.recipient.permissionClass ?? null, recipientInboundPolicy: sent.recipient.inboundPolicy ?? null } : {}),
+      replyThreadId: sent.replyThreadId ?? null,
+      ...(sent.accountContext ? { accountContext: { ...sent.accountContext } } : {}),
+      ...(sent.scopeBindings ? { scopeBindings: structuredClone(sent.scopeBindings), senderCwd: sent.scopeBindings.sender?.path ?? null } : {}),
+      pending: this.pendingMessages.has(msgId),
+      ...(isInterruptedDelivery(delivery) ? {
+        outcome: "unknown", waitEnded: true, taskCancelled: false, retrySafe: false,
+        nextAction: "inspect_existing_task_then_follow_up",
+        interruption: { reasonCode: delivery.reasonCode, source: delivery.source,
+          observedAt: delivery.observedAt, entryIds: delivery.interruptedBy,
+          backgroundTaskIds: delivery.backgroundTaskIds },
+      } : {}),
+      ...(sent.reply ? { reply: sent.reply.text, source: sent.reply.source ?? "peer", ...(sent.reply.absorbed ? { replyAbsorbed: true } : {}), ...(sent.reply.forwardingError ? { forwardingError: { ...sent.reply.forwardingError } } : {}) } : {}),
+    };
+  }
+
+  reloadReason() {
+    this.#refreshTranscriptReplies();
+    if (this.connections.size) return "Peer socket connections are still open";
+    if (this.requestQueues.size) return "Claude messages are still being sent";
+    const counts = new Map();
+    for (const [id, pending] of this.pendingMessages) {
+      const sent = this.sentMessages.get(id);
+      if (!resumableTranscriptDelivery(id, sent, this.deliveryReceipts.get(id))
+        || pending.targetSocket !== sent.targetSocket || JSON.stringify(pending.transcriptSession) !== JSON.stringify(sent.transcriptSession)) {
+        return "Claude messages still have pending or unconfirmed delivery";
+      }
+      counts.set(sent.targetSocket, (counts.get(sent.targetSocket) ?? 0) + 1);
+    }
+    if (counts.size !== this.unconfirmedReplies.size || [...counts].some(([socket, count]) => this.unconfirmedReplies.get(socket) !== count)) {
+      return "Claude messages still have pending or unconfirmed delivery";
+    }
+    for (const [id, sent] of this.sentMessages) {
+      if (!sent.reply && !sent.failed && !isTerminalDelivery(this.deliveryReceipts.get(id)) && !this.pendingMessages.has(id)) {
+        return "A Claude delivery outcome remains unconfirmed";
+      }
+    }
+    return null;
+  }
+
+  async quiesce() {
+    const reason = this.reloadReason();
+    if (reason) throw new Error(reason);
+    const withdrawn = this.started && !IS_WINDOWS;
+    if (withdrawn) { try { fs.rmSync(this.socketPath, { force: true }); } catch {} }
+    await drainPendingAccepts();
+    const deadline = Date.now() + RELOAD_DRAIN_MS;
+    while (this.connections.size && Date.now() < deadline) await new Promise((resolve) => globalThis.setTimeout(resolve, 10));
+    const late = this.reloadReason();
+    if (late) {
+      if (withdrawn) {
+        try { this.server?.close(); } catch {}
+        this.started = false;
+      }
+      throw new Error(late);
+    }
+    const revision = this.activityRevision;
+    this.reloadPaused = true;
+    globalThis.clearInterval(this.responsePoll);
+    this.responsePoll = null;
+    if (this.server?.listening) {
+      await new Promise((resolve, reject) => this.server.close((error) => error ? reject(error) : resolve()));
+    }
+    this.started = false;
+    this.#removeRegistration();
+    if (revision !== this.activityRevision || this.reloadReason()) throw new Error("Peer activity raced with reload; the endpoint remains quiesced");
+  }
+
+  closeIntake() {
+    this.intakeClosed = true;
+    this.#removeRegistration();
+    if (this.server?.listening) this.server.close();
+  }
+
+  async resume() {
+    this.reloadPaused = false;
+    await this.start();
+  }
+
+  exportReloadState() {
+    const reason = this.reloadReason();
+    if (reason || this.started && !this.reloadPaused) throw new Error(reason ?? "Quiesce the peer endpoint before exporting state");
+    return cloneReloadState({ name: this.name, messageSequence: this.messageSequence, inbox: this.inbox,
+      sentMessages: [...this.sentMessages], deliveryReceipts: [...this.deliveryReceipts],
+      pendingMessages: [...this.pendingMessages].map(([id, pending]) => [id, { targetSocket: pending.targetSocket, transcriptSession: pending.transcriptSession }]) });
+  }
+
+  restoreReloadState(input) {
+    if (this.started || this.connections.size || this.sentMessages.size || this.inbox.length || this.pendingMessages.size
+      || this.unconfirmedReplies.size || this.requestQueues.size || this.responsePoll) throw new Error("Peer reload state requires an empty dormant endpoint");
+    const state = cloneReloadState(input);
+    if (!state || typeof state.name !== "string" || !state.name || !Number.isSafeInteger(state.messageSequence) || state.messageSequence < 0
+      || !Array.isArray(state.inbox) || !Array.isArray(state.sentMessages) || !Array.isArray(state.deliveryReceipts)
+      || state.pendingMessages !== undefined && !Array.isArray(state.pendingMessages)) throw new Error("Invalid peer reload state");
+    const restoreMap = (entries) => {
+      const restored = new Map();
+      for (const pair of entries) {
+        if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string" || !pair[0] || restored.has(pair[0])
+          || !pair[1] || typeof pair[1] !== "object" || Array.isArray(pair[1])) throw new Error("Invalid peer reload record");
+        restored.set(pair[0], pair[1]);
+      }
+      return restored;
+    };
+    const sentMessages = restoreMap(state.sentMessages);
+    const deliveryReceipts = restoreMap(state.deliveryReceipts);
+    const pendingMessages = restoreMap(state.pendingMessages ?? []);
+    const unconfirmedReplies = new Map();
+    for (const [id, pending] of pendingMessages) {
+      const sent = sentMessages.get(id);
+      if (!resumableTranscriptDelivery(id, sent, deliveryReceipts.get(id))
+        || pending.targetSocket !== sent.targetSocket || JSON.stringify(pending.transcriptSession) !== JSON.stringify(sent.transcriptSession)) {
+        throw new Error("Invalid pending Claude transcript reload record");
+      }
+      delete pending.transcriptStamp;
+      unconfirmedReplies.set(sent.targetSocket, (unconfirmedReplies.get(sent.targetSocket) ?? 0) + 1);
+    }
+    for (const record of state.inbox) {
+      if (!record || typeof record.text !== "string" || !Number.isSafeInteger(record.sequence) || record.sequence < 1
+        || record.sequence > state.messageSequence || !Number.isFinite(record.receivedAt)) throw new Error("Invalid inbox reload record");
+    }
+    for (const [id, sent] of sentMessages) {
+      if (typeof sent.targetSocket !== "string" || !sent.targetSocket || !Number.isFinite(sent.sentAt)
+        || sent.reply && (typeof sent.reply.text !== "string" || sent.reply.inReplyTo !== id)
+        || !sent.reply && !sent.failed && !isTerminalDelivery(deliveryReceipts.get(id)) && !pendingMessages.has(id)
+        || isInterruptedDelivery(deliveryReceipts.get(id)) && deliveryReceipts.get(id).inReplyTo !== id) {
+        throw new Error("Invalid or unconfirmed Claude delivery reload record");
+      }
+    }
+    this.name = state.name;
+    this.messageSequence = state.messageSequence;
+    this.inbox = state.inbox;
+    this.sentMessages = sentMessages;
+    this.deliveryReceipts = deliveryReceipts;
+    this.pendingMessages = pendingMessages;
+    this.unconfirmedReplies = unconfirmedReplies;
+    this.transcriptPollingPaused = true;
+  }
+
+  #removeRegistration() {
+    for (const file of [this.socketPath, this.registryPath, this.keyPath]) {
+      if (!file) continue;
+      try { fs.rmSync(file, { force: true }); } catch {}
+    }
+  }
+
+  stop() {
+    this.startGeneration += 1;
+    this.aclReady = !IS_WINDOWS || !this.protectSocket;
+    for (const socket of this.provisionalSockets) socket.destroy();
+    this.provisionalSockets.clear();
+    globalThis.clearInterval(this.responsePoll);
+    this.responsePoll = null;
+    this.pendingMessages.clear();
+    const server = this.server;
+    this.closed = new Promise((resolve) => {
+      if (!server) return resolve();
+      try { server.close(() => resolve()); }
+      catch { resolve(); }
+    });
+    for (const socket of this.connections) socket.destroy();
+    this.connections.clear();
+    this.#removeRegistration();
+    this.started = false;
+  }
+}

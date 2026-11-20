@@ -1,0 +1,141 @@
+export function assertRoutingReload(previous, next) {
+  if (typeof previous !== "boolean" || typeof next !== "boolean" || previous && !next) {
+    throw new Error("Invalid routing reload or Desktop-to-app-server downgrade; reconnect explicitly to change to legacy mode");
+  }
+}
+
+export function cloneReloadState(value) {
+  const encoded = JSON.stringify(value);
+  if (typeof encoded !== "string" || Buffer.byteLength(encoded) > 16 * 1024 * 1024) {
+    throw new Error("Reload state is missing or exceeds its transfer limit");
+  }
+  return JSON.parse(encoded);
+}
+
+export function clientReloadReason(client) {
+  if (!client) return null;
+  for (const field of ["pending", "threadOperations", "attachingThreads", "activeTurns", "threadListeners"]) {
+    if (client[field]?.size) return `The app-server still has ${field}`;
+  }
+  if (client.connecting) return "The app-server connection is still being established";
+  return null;
+}
+
+export async function drainPendingAccepts(turns = 3) {
+  for (let turn = 0; turn < turns; turn++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+export function createReloadControl({ entry, inspect = () => null, quiesce = () => {}, exportState = () => ({}), restore = () => {}, activate = () => {}, resume = activate, env = process.env, channel = process } = {}) {
+  if (!["index.mjs", "claude-bridge.mjs", "native-relay-companion.mjs", "antigravity-bridge.mjs", "antigravity-outbound-bridge.mjs"].includes(entry)) throw new Error("Invalid reload entry point");
+  const enabled = env.CODEX_BRIDGE_WORKER === "1" && typeof channel.send === "function";
+  let phase = enabled && env.CODEX_BRIDGE_STAGED === "1" ? "staged" : "active";
+  let active = 0;
+  let deferred = null;
+  let listening = false;
+  let commands = Promise.resolve();
+
+  const status = () => {
+    const reason = active ? "MCP tool calls are still active" : deferred ?? inspect();
+    return { reloadable: phase === "active" && !reason, reason: reason ?? (phase === "active" ? null : `The worker is ${phase}`), schema: 1, phase };
+  };
+
+  const control = async (action, data) => {
+    if (action === "inspect") return status();
+    if (action === "quiesce") {
+      const current = status();
+      if (!current.reloadable) throw new Error(current.reason);
+      phase = "quiescing";
+      try {
+        await quiesce();
+        const reason = deferred ?? inspect();
+        if (active || reason) throw new Error(reason ?? "A tool call raced with quiescence");
+        const state = cloneReloadState({ schema: 1, entry, payload: exportState() });
+        phase = "quiesced";
+        return { state };
+      } catch (error) {
+        phase = "quiesced";
+        throw error;
+      }
+    }
+    if (action === "restore") {
+      if (phase !== "staged") throw new Error("Reload state can only be restored into a staged worker");
+      const state = cloneReloadState(data);
+      if (!state || state.schema !== 1 || state.entry !== entry || !state.payload || typeof state.payload !== "object" || Array.isArray(state.payload)) {
+        throw new Error("Reload state schema or entry point does not match this worker");
+      }
+      await restore(state.payload);
+      return { restored: true, schema: 1 };
+    }
+    if (action === "activate" || action === "resume") {
+      if (phase === "active") return { active: true, schema: 1 };
+      if (action === "activate" && phase !== "staged" || action === "resume" && phase !== "quiesced") {
+        throw new Error(`Cannot ${action} a ${phase} worker`);
+      }
+      await (action === "activate" ? activate() : resume());
+      phase = "active";
+      return { active: true, schema: 1 };
+    }
+    throw new Error("Unknown bridge control action");
+  };
+
+  return {
+    get staged() { return phase === "staged"; },
+    inspect: status,
+    defer(reason) { deferred ??= String(reason); },
+    async run(handler) {
+      if (phase !== "active") throw Object.assign(new Error(`Bridge worker is ${phase}; no tool operation was started`), { code: "MCP_WORKER_QUIESCED", phase: "lifecycle", deliveryState: "not_sent", sent: false });
+      active += 1;
+      try { return await handler(); }
+      finally { active -= 1; }
+    },
+    control,
+    listen() {
+      if (!enabled || listening) return;
+      listening = true;
+      channel.on("message", (message) => {
+        if (message?.type !== "bridge:control" || !["string", "number"].includes(typeof message.id)) return;
+        commands = commands.catch(() => {}).then(async () => {
+          let response;
+          try { response = { result: await control(message.action, message.data) }; }
+          catch (error) { response = { error: error?.message ?? String(error) }; }
+          if (channel.connected !== false) channel.send({ type: "bridge:control-result", id: message.id, ...response });
+        });
+      });
+    },
+  };
+}
+
+export const CLIENT_CLOSE_DRAIN_MS = 35000;
+export const CLIENT_CLOSE_STOP_MS = 5000;
+
+export function exitWhenClientCloses({ prepare = () => {}, busy = () => null, stop = () => {}, log = () => {}, drainMs = CLIENT_CLOSE_DRAIN_MS, stopMs = CLIENT_CLOSE_STOP_MS, pollMs = 50, stdin = process.stdin, channel = process, outputs = [process.stdout, process.stderr], exit = (code) => process.exit(code) } = {}) {
+  let closing = null;
+  const bounded = (promise, ms) => {
+    let timer;
+    return Promise.race([Promise.resolve(promise).then(() => true), new Promise((resolve) => { timer = setTimeout(() => resolve(false), ms); })])
+      .finally(() => clearTimeout(timer));
+  };
+  const close = (why) => closing ??= (async () => {
+    log(`MCP client closed (${why}); draining before exit`);
+    let code = 0;
+    try {
+      await prepare();
+      const deadline = Date.now() + drainMs;
+      let reason = busy();
+      while (reason && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        reason = busy();
+      }
+      if (reason) log(`exiting after ${drainMs} ms with work still open: ${reason}`);
+      if (!await bounded(stop(), stopMs)) log(`listener shutdown exceeded ${stopMs} ms`);
+    } catch (error) {
+      code = 1;
+      log(`shutdown failed: ${error?.message ?? String(error)}`);
+    }
+    exit(code);
+  })();
+  for (const output of outputs) output?.on("error", (error) => { void close(`output failed: ${error?.code ?? error?.message}`); });
+  stdin?.once("end", () => { void close("stdin ended"); });
+  channel?.once("disconnect", () => { void close("supervisor channel disconnected"); });
+  return { close, get closing() { return closing !== null; } };
+}
